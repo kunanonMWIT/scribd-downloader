@@ -34,9 +34,13 @@
 
 ---
 
+> **Credits:** This project is an enhanced fork of [themrsami/scribd-downloader](https://github.com/themrsami/scribd-downloader), originally created by [Usama Nazir](https://github.com/fullstackusama). This fork adds uv-based packaging and an importable Python API on top of the original download engine.
+
 ## Features
 
 - **One-click download** - Just paste the Scribd URL and get your PDF
+- **uv-ready** - Install, run, and manage with [uv](https://docs.astral.sh/uv/): `uv sync`, `uv run`, or `uvx`
+- **Importable API** - Use it programmatically: `from scribd_downloader import download`
 - **Supports both Scribd URL styles** - Works with `/document/...` and legacy `/doc/...` links
 - **Runs in background** - Headless Chrome, no browser window pops up
 - **No scrolling required** - Loads Scribd page data directly instead of simulating page-by-page scrolling
@@ -54,7 +58,7 @@
 
 ## Requirements
 
-- Python 3.10 or higher
+- [uv](https://docs.astral.sh/uv/) - manages the Python version (3.10+), the virtual environment, and all dependencies automatically
 - Google Chrome browser installed
 - Chrome WebDriver (auto-managed by Selenium)
 
@@ -64,50 +68,95 @@
 
 1. **Clone the repository**
    ```bash
-   git clone https://github.com/fullstackusama/scribd-downloader.git
+   git clone https://github.com/kunanonMWIT/scribd-downloader.git
    cd scribd-downloader
    ```
 
-2. **Install dependencies**
+2. **Sync the environment** - `uv` provisions Python, creates an isolated `.venv`, and installs all dependencies (also generates `uv.lock` for reproducible installs):
    ```bash
-   pip install -r requirements.txt
+   uv sync
    ```
+
+No clone needed? Run it straight from GitHub:
+
+```bash
+uvx --from git+https://github.com/kunanonMWIT/scribd-downloader scribd-downloader
+```
 
 ---
 
 ## Usage
 
-1. **Run the script**
-   ```bash
-   python scribd-downloader.py
-   ```
+### Command line
 
-2. **Paste the Scribd document URL** when prompted:
-   ```
-   Input link Scribd: https://www.scribd.com/document/123456789/Document-Title
-   ```
+```bash
+# Interactive - prompts for the URL
+uv run scribd-downloader
 
-   Legacy Scribd URLs also work:
-   ```
-   Input link Scribd: https://www.scribd.com/doc/123456789/Document-Title
-   ```
+# Or pass the URL directly
+uv run scribd-downloader https://www.scribd.com/document/123456789/Document-Title
 
-3. **Wait for the download** - The script will:
-   - Open the document in headless Chrome
-   - Load document pages directly in bounded batches
-   - Release each batch from Chrome after printing to control memory use
-   - Remove unwanted elements (toolbars, cookie banners)
-   - Spool individual pages to temporary storage and merge the final PDF
-   - Save the PDF in the current directory
+# Custom output path and a visible browser window
+uv run scribd-downloader <url> -o my-document.pdf --visible
 
-4. **Done!** Your PDF will be saved with the document name from the URL.
+# Tune the export
+uv run scribd-downloader <url> --batch-size 4 --cdp-timeout 900
+
+# Equivalent module entry point
+uv run python -m scribd_downloader
+```
+
+Useful CLI flags: `-o/--output` (PDF path), `--visible`, `--batch-size`, `--cdp-timeout`, `--page-load-timeout`, `--concurrency`, `-q/--quiet`, `--version`.
+
+Both Scribd URL styles work: `/document/...` and legacy `/doc/...`.
+
+While running, the downloader opens the document in headless Chrome, loads document pages directly in bounded batches, releases each batch from Chrome after printing to control memory use, removes unwanted elements (toolbars, cookie banners), spools individual pages to temporary storage, and merges the final PDF. Your PDF is saved with the document name from the URL.
+
+### As a Python library
+
+The downloader is importable as a plain function:
+
+```python
+from scribd_downloader import download
+
+# Saves "<Document-Title>.pdf" in the current directory and returns a pathlib.Path
+pdf_path = download("https://www.scribd.com/document/123456789/Document-Title")
+
+# Choose your own output path
+pdf_path = download(url, output="reports/lecture-notes.pdf")
+
+# Tune the browser and export behavior
+pdf_path = download(
+    url,
+    output="manual.pdf",
+    headless=False,           # watch Chrome work
+    export_batch_size=4,      # fewer pages in memory at once
+    cdp_timeout_seconds=900,  # more patient PDF printing
+    log=None,                 # silence progress messages
+)
+```
+
+Failures raise catchable exceptions:
+
+```python
+from scribd_downloader import download, ScribdDownloadError
+
+try:
+    download("https://www.scribd.com/document/123456789/Document-Title")
+except ScribdDownloadError as error:
+    print("Download failed:", error)
+```
+
+`InvalidScribdUrlError` (a subclass) is raised for malformed URLs. Progress messages go to any callable via `log=logger.info`, or are silenced with `log=None`. The `SCRIBD_*` environment variables documented below still apply whenever no explicit options are passed.
+
+Any script in this project can simply `import scribd_downloader` once the environment is synced (`uv sync`), then run with `uv run python your_script.py`. From anywhere else, point uv at the project: `uv run --with git+https://github.com/kunanonMWIT/scribd-downloader python your_script.py`.
 
 ---
 
 ## Example Output
 
 ```text
-$ python scribd-downloader.py
+$ uv run scribd-downloader
 Input link Scribd: https://www.scribd.com/document/903361807/WorkdaySimpleIntegrations-EIB-31v2
 
 Link embed: https://www.scribd.com/embeds/903361807/content
@@ -179,7 +228,8 @@ The batch size was `8` in both tests. Long documents still take time because Chr
 ### "ChromeDriver not found" error
 The script uses Selenium Manager to auto-download ChromeDriver. If you face issues:
 ```bash
-pip install --upgrade selenium
+uv lock --upgrade-package selenium
+uv sync
 ```
 
 ### PDF not saving
@@ -205,7 +255,7 @@ You can tune the export with environment variables:
 $env:SCRIBD_CDP_TIMEOUT="900"
 $env:SCRIBD_PAGE_LOAD_TIMEOUT="180"
 $env:SCRIBD_EXPORT_BATCH_SIZE="4"
-python scribd-downloader.py
+uv run scribd-downloader
 ```
 
 Useful variables:

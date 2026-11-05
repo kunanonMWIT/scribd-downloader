@@ -4,22 +4,40 @@ Scribd Document Downloader
 
 A Selenium-based utility that loads a Scribd embed and saves it as a PDF.
 
+Public entry points
+-------------------
+
+- ``download(url, ...)``: download a Scribd document as a PDF from Python.
+- ``DownloadOptions``: dataclass with every tunable knob.
+- ``convert_scribd_link`` / ``extract_document_id`` / ``get_filename_from_url``:
+  URL helpers.
+- ``ScribdDownloadError`` / ``InvalidScribdUrlError``: catchable exceptions.
+
 Key behaviors:
 1. Converts a Scribd document URL to the embed/content URL.
 2. Opens the document in Chrome.
-3. Scrolls through every page to trigger lazy loading.
+3. Loads document pages in bounded batches (with a scrolling fallback).
 4. Removes UI overlays without stripping layout classes needed for rendering.
 5. Waits for fonts, images, and page geometry to settle.
 6. Saves the PDF through Chrome DevTools Protocol with a larger timeout and
    stream-based PDF transfer for large documents.
+
+The ``SCRIBD_*`` environment variables keep their original meaning and are
+honored by ``DownloadOptions.from_env()``, which ``download()`` uses whenever
+it is called without explicit options.
 """
+
+from __future__ import annotations
 
 import base64
 import os
 import re
 import tempfile
 import time
+from dataclasses import dataclass, replace
 from io import BytesIO
+from pathlib import Path
+from typing import Callable
 from urllib.parse import unquote, urlparse
 
 from selenium import webdriver
@@ -27,52 +45,93 @@ from selenium.common.exceptions import WebDriverException
 from selenium.webdriver.chrome.options import Options
 
 
-DEFAULT_CDP_TIMEOUT_SECONDS = int(os.getenv("SCRIBD_CDP_TIMEOUT", "600"))
-DEFAULT_RENDER_SETTLE_TIMEOUT_SECONDS = int(
-    os.getenv("SCRIBD_RENDER_SETTLE_TIMEOUT", "30")
+SCRIBD_DOCUMENT_URL_PATTERN = re.compile(
+    r"https://www\.scribd\.com/(?:document|doc)/(\d+)/"
 )
-DEFAULT_SCROLL_DELAY_SECONDS = float(os.getenv("SCRIBD_SCROLL_DELAY", "0.15"))
-DEFAULT_PAGE_LOAD_CONCURRENCY = max(
-    1,
-    int(os.getenv("SCRIBD_PAGE_LOAD_CONCURRENCY", "8")),
-)
-DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS = max(
-    10,
-    int(os.getenv("SCRIBD_PAGE_LOAD_TIMEOUT", "120")),
-)
-DEFAULT_EXPORT_BATCH_SIZE = max(
-    1,
-    int(os.getenv("SCRIBD_EXPORT_BATCH_SIZE", "8")),
-)
-PDF_STREAM_CHUNK_SIZE = int(os.getenv("SCRIBD_PDF_STREAM_CHUNK_SIZE", str(1024 * 1024)))
-HEADLESS_ENABLED = os.getenv("SCRIBD_HEADLESS", "1").strip().lower() not in {
-    "0",
-    "false",
-    "no",
-}
+
 DEFAULT_PAPER_WIDTH_INCHES = 7.25
 DEFAULT_PAPER_HEIGHT_INCHES = 10.5
 
+LogFunction = Callable[[str], None]
 
-def build_chrome_options(runtime_profile_dir):
-    """Create Chrome options for reliable headless PDF generation."""
-    options = Options()
 
-    if HEADLESS_ENABLED:
-        options.add_argument("--headless=new")
+def _noop_log(message: str) -> None:
+    """Discard progress messages (used when ``log=None``)."""
 
-    options.add_argument("--window-size=1600,2200")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--remote-debugging-port=0")
-    options.add_argument(f"--user-data-dir={runtime_profile_dir}")
-    options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_argument("--force-color-profile=srgb")
-    options.add_argument("--hide-scrollbars")
-    options.add_experimental_option("excludeSwitches", ["enable-automation"])
-    options.add_experimental_option("useAutomationExtension", False)
-    return options
+
+class ScribdDownloadError(RuntimeError):
+    """Raised when a Scribd document cannot be loaded, printed, or saved."""
+
+
+class InvalidScribdUrlError(ScribdDownloadError, ValueError):
+    """Raised when a URL is not a valid Scribd document URL."""
+
+
+@dataclass(frozen=True)
+class DownloadOptions:
+    """
+    Every tunable knob of the downloader.
+
+    Defaults mirror the original environment-variable driven configuration.
+    Use :meth:`from_env` to build an instance from the ``SCRIBD_*``
+    environment variables, or construct one directly (or via
+    ``dataclasses.replace``) to override individual fields.
+    """
+
+    headless: bool = True
+    cdp_timeout_seconds: int = 600
+    render_settle_timeout_seconds: int = 30
+    scroll_delay_seconds: float = 0.15
+    page_load_concurrency: int = 8
+    page_load_timeout_seconds: int = 120
+    export_batch_size: int = 8
+    pdf_stream_chunk_size: int = 1024 * 1024
+
+    @classmethod
+    def from_env(cls) -> "DownloadOptions":
+        """Read the ``SCRIBD_*`` environment variables into options."""
+        return cls(
+            headless=(
+                os.getenv("SCRIBD_HEADLESS", "1").strip().lower()
+                not in {"0", "false", "no"}
+            ),
+            cdp_timeout_seconds=int(os.getenv("SCRIBD_CDP_TIMEOUT", "600")),
+            render_settle_timeout_seconds=int(
+                os.getenv("SCRIBD_RENDER_SETTLE_TIMEOUT", "30")
+            ),
+            scroll_delay_seconds=float(os.getenv("SCRIBD_SCROLL_DELAY", "0.15")),
+            page_load_concurrency=max(
+                1,
+                int(os.getenv("SCRIBD_PAGE_LOAD_CONCURRENCY", "8")),
+            ),
+            page_load_timeout_seconds=max(
+                10,
+                int(os.getenv("SCRIBD_PAGE_LOAD_TIMEOUT", "120")),
+            ),
+            export_batch_size=max(
+                1,
+                int(os.getenv("SCRIBD_EXPORT_BATCH_SIZE", "8")),
+            ),
+            pdf_stream_chunk_size=int(
+                os.getenv("SCRIBD_PDF_STREAM_CHUNK_SIZE", str(1024 * 1024))
+            ),
+        )
+
+
+def extract_document_id(url):
+    """
+    Extract the numeric document id from a Scribd URL.
+
+    Args:
+        url: Scribd document URL such as
+            https://www.scribd.com/document/123456789/Document-Title
+            or https://www.scribd.com/doc/123456789/Document-Title
+
+    Returns:
+        The document id as a string, or None if no id can be extracted.
+    """
+    match = SCRIBD_DOCUMENT_URL_PATTERN.search(url or "")
+    return match.group(1) if match else None
 
 
 def convert_scribd_link(url):
@@ -85,14 +144,20 @@ def convert_scribd_link(url):
             or https://www.scribd.com/doc/123456789/Document-Title
 
     Returns:
-        The embeddable content URL, or "Invalid Scribd URL" if no document id
-        can be extracted.
-    """
-    match = re.search(r"https://www\.scribd\.com/(?:document|doc)/(\d+)/", url)
-    if not match:
-        return "Invalid Scribd URL"
+        The embeddable content URL.
 
-    return f"https://www.scribd.com/embeds/{match.group(1)}/content"
+    Raises:
+        InvalidScribdUrlError: If no document id can be extracted.
+    """
+    document_id = extract_document_id(url)
+    if document_id is None:
+        raise InvalidScribdUrlError(
+            "No Scribd document id found in URL. Expected something like "
+            "https://www.scribd.com/document/123456789/Document-Title or "
+            "https://www.scribd.com/doc/123456789/Document-Title."
+        )
+
+    return f"https://www.scribd.com/embeds/{document_id}/content"
 
 
 def get_filename_from_url(url):
@@ -109,6 +174,27 @@ def get_filename_from_url(url):
     path = parsed.path.rstrip("/")
     last_segment = path.split("/")[-1] if path else "scribd_document"
     return f"{unquote(last_segment)}.pdf"
+
+
+def build_chrome_options(runtime_profile_dir, options):
+    """Create Chrome options for reliable headless PDF generation."""
+    chrome_options = Options()
+
+    if options.headless:
+        chrome_options.add_argument("--headless=new")
+
+    chrome_options.add_argument("--window-size=1600,2200")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--remote-debugging-port=0")
+    chrome_options.add_argument(f"--user-data-dir={runtime_profile_dir}")
+    chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+    chrome_options.add_argument("--force-color-profile=srgb")
+    chrome_options.add_argument("--hide-scrollbars")
+    chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    chrome_options.add_experimental_option("useAutomationExtension", False)
+    return chrome_options
 
 
 def configure_command_timeout(driver, timeout_seconds):
@@ -222,7 +308,7 @@ def hide_cookie_dialogs(driver):
     )
 
 
-def scroll_through_pages(driver, scroll_delay_seconds):
+def scroll_through_pages(driver, scroll_delay_seconds, log=_noop_log):
     """
     Scroll through all detected pages until the page count stabilizes.
 
@@ -238,7 +324,7 @@ def scroll_through_pages(driver, scroll_delay_seconds):
         total_pages = len(page_elements)
 
         if total_pages == 0:
-            print("No page elements were detected.")
+            log("No page elements were detected.")
             return 0
 
         if total_pages == last_total_pages:
@@ -248,9 +334,9 @@ def scroll_through_pages(driver, scroll_delay_seconds):
             last_total_pages = total_pages
 
         if scrolled_count == 0:
-            print(f"Found {total_pages} pages, scrolling...")
+            log(f"Found {total_pages} pages, scrolling...")
         elif total_pages > scrolled_count:
-            print(f"Detected {total_pages} pages after lazy loading, continuing...")
+            log(f"Detected {total_pages} pages after lazy loading, continuing...")
 
         for index in range(scrolled_count, total_pages):
             driver.execute_script(
@@ -260,16 +346,16 @@ def scroll_through_pages(driver, scroll_delay_seconds):
             time.sleep(scroll_delay_seconds)
 
             if (index + 1) % 10 == 0:
-                print(f"  Scrolled {index + 1}/{total_pages} pages...")
+                log(f"  Scrolled {index + 1}/{total_pages} pages...")
 
         scrolled_count = total_pages
         time.sleep(0.5)
 
-    print(f"All {scrolled_count} pages loaded.")
+    log(f"All {scrolled_count} pages loaded.")
     return scrolled_count
 
 
-def load_all_pages(driver):
+def load_all_pages(driver, options, log=_noop_log):
     """Load Scribd pages directly, without simulating user scrolling."""
     page_count = driver.execute_script(
         """
@@ -280,11 +366,11 @@ def load_all_pages(driver):
     )
     batch_count = max(
         1,
-        (page_count + DEFAULT_PAGE_LOAD_CONCURRENCY - 1)
-        // DEFAULT_PAGE_LOAD_CONCURRENCY,
+        (page_count + options.page_load_concurrency - 1)
+        // options.page_load_concurrency,
     )
     document_timeout_seconds = (
-        DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS * batch_count
+        options.page_load_timeout_seconds * batch_count
     )
     configure_command_timeout(driver, document_timeout_seconds + 10)
     driver.set_script_timeout(document_timeout_seconds + 10)
@@ -402,23 +488,23 @@ def load_all_pages(driver):
 
         launchMore();
         """,
-        DEFAULT_PAGE_LOAD_CONCURRENCY,
-        DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS * 1000,
+        options.page_load_concurrency,
+        options.page_load_timeout_seconds * 1000,
         document_timeout_seconds * 1000,
     )
 
     if not result.get("supported"):
-        print("Direct page loader unavailable; using scrolling fallback.")
-        return scroll_through_pages(driver, DEFAULT_SCROLL_DELAY_SECONDS)
+        log("Direct page loader unavailable; using scrolling fallback.")
+        return scroll_through_pages(driver, options.scroll_delay_seconds, log)
 
     total_pages = result["total"]
     loaded_pages = result["loaded"]
     elapsed_seconds = result["elapsedMs"] / 1000
 
-    print(
+    log(
         f"Loaded {loaded_pages}/{total_pages} pages directly "
         f"in {elapsed_seconds:.2f}s "
-        f"(concurrency: {DEFAULT_PAGE_LOAD_CONCURRENCY})."
+        f"(concurrency: {options.page_load_concurrency})."
     )
 
     if result["failed"]:
@@ -426,7 +512,7 @@ def load_all_pages(driver):
             str(item["pageNum"])
             for item in result["failed"]
         )
-        raise RuntimeError(
+        raise ScribdDownloadError(
             "Failed to load Scribd page(s): "
             f"{failed_pages}"
         )
@@ -434,7 +520,7 @@ def load_all_pages(driver):
     return loaded_pages
 
 
-def prepare_document_for_print(driver):
+def prepare_document_for_print(driver, log=_noop_log):
     """
     Remove UI chrome and make the scroll containers printable.
 
@@ -478,14 +564,14 @@ def prepare_document_for_print(driver):
     )
 
     if result["toolbarTop"]:
-        print("Top toolbar removed.")
+        log("Top toolbar removed.")
     if result["toolbarBottom"]:
-        print("Bottom toolbar removed.")
+        log("Bottom toolbar removed.")
 
-    print(f"Adjusted {result['containers']} scroll containers for print.")
+    log(f"Adjusted {result['containers']} scroll containers for print.")
 
 
-def inject_print_styles(driver):
+def inject_print_styles(driver, log=_noop_log):
     """Install conservative print CSS without hiding Scribd document content."""
     driver.execute_script(
         """
@@ -572,10 +658,10 @@ def inject_print_styles(driver):
         """
     )
 
-    print("Print CSS injected.")
+    log("Print CSS injected.")
 
 
-def wait_for_render_stability(driver, timeout_seconds):
+def wait_for_render_stability(driver, timeout_seconds, log=_noop_log):
     """
     Wait for fonts, images, and page dimensions to settle before printing.
 
@@ -652,13 +738,13 @@ def wait_for_render_stability(driver, timeout_seconds):
             int(timeout_seconds * 1000),
         )
     except WebDriverException as error:
-        print(f"Render settle check failed; continuing with best effort: {error}")
+        log(f"Render settle check failed; continuing with best effort: {error}")
         return
 
     if result.get("timedOut"):
-        print("Render settle reached its time budget; continuing with best effort.")
+        log("Render settle reached its time budget; continuing with best effort.")
     else:
-        print("Document render settled before export.")
+        log("Document render settled before export.")
 
 
 def detect_document_paper_size(driver):
@@ -712,7 +798,7 @@ def detect_document_paper_size(driver):
     }
 
 
-def read_pdf_stream_to_file(driver, stream_handle, filename):
+def read_pdf_stream_to_file(driver, stream_handle, filename, chunk_size=1024 * 1024):
     """Read a streamed CDP PDF result and write it to disk in chunks."""
     try:
         with open(filename, "wb") as file_handle:
@@ -721,7 +807,7 @@ def read_pdf_stream_to_file(driver, stream_handle, filename):
                     "IO.read",
                     {
                         "handle": stream_handle,
-                        "size": PDF_STREAM_CHUNK_SIZE,
+                        "size": chunk_size,
                     },
                 )
 
@@ -740,13 +826,13 @@ def read_pdf_stream_to_file(driver, stream_handle, filename):
         driver.execute_cdp_cmd("IO.close", {"handle": stream_handle})
 
 
-def load_page_batch(driver, page_numbers):
+def load_page_batch(driver, page_numbers, options):
     """Load one bounded batch of page DOM and image assets."""
     configure_command_timeout(
         driver,
-        DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS + 10,
+        options.page_load_timeout_seconds + 10,
     )
-    driver.set_script_timeout(DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS + 10)
+    driver.set_script_timeout(options.page_load_timeout_seconds + 10)
 
     result = driver.execute_async_script(
         """
@@ -853,18 +939,18 @@ def load_page_batch(driver, page_numbers):
         }, 50);
         """,
         list(page_numbers),
-        DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS * 1000,
+        options.page_load_timeout_seconds * 1000,
     )
 
     if not result.get("supported"):
-        raise RuntimeError("Scribd direct page loader is unavailable.")
+        raise ScribdDownloadError("Scribd direct page loader is unavailable.")
 
     if result["failed"]:
         details = ", ".join(
             f"{item['pageNum']} ({item['reason']})"
             for item in result["failed"]
         )
-        raise RuntimeError(f"Failed to load Scribd page(s): {details}")
+        raise ScribdDownloadError(f"Failed to load Scribd page(s): {details}")
 
 
 def release_page_batch(driver, page_numbers):
@@ -907,13 +993,15 @@ def release_page_batch(driver, page_numbers):
 def save_pdf_pages_individually(
     driver,
     filename,
-    timeout_seconds=DEFAULT_CDP_TIMEOUT_SECONDS,
+    options,
+    log=_noop_log,
 ):
+    """Export each document page as one PDF sheet and merge them with pypdf."""
     from pypdf import PdfReader, PdfWriter
 
     configure_command_timeout(
         driver,
-        timeout_seconds,
+        options.cdp_timeout_seconds,
     )
 
     page_count = driver.execute_script(
@@ -925,14 +1013,14 @@ def save_pdf_pages_individually(
     )
 
     if page_count <= 0:
-        raise RuntimeError(
+        raise ScribdDownloadError(
             "No .outer_page elements found."
         )
 
-    print(
+    log(
         f"Exporting {page_count} "
         "document pages in bounded batches "
-        f"of {DEFAULT_EXPORT_BATCH_SIZE}..."
+        f"of {options.export_batch_size}..."
     )
 
     spool = tempfile.TemporaryDirectory(
@@ -942,21 +1030,22 @@ def save_pdf_pages_individually(
 
     try:
         for index in range(page_count):
-            if index % DEFAULT_EXPORT_BATCH_SIZE == 0:
+            if index % options.export_batch_size == 0:
                 batch_end = min(
                     page_count,
-                    index + DEFAULT_EXPORT_BATCH_SIZE,
+                    index + options.export_batch_size,
                 )
                 batch_page_numbers = list(
                     range(index + 1, batch_end + 1)
                 )
-                print(
+                log(
                     f"  Loading page batch "
                     f"{index + 1}-{batch_end}/{page_count}..."
                 )
                 load_page_batch(
                     driver,
                     batch_page_numbers,
+                    options,
                 )
 
             page_info = driver.execute_script(
@@ -1117,7 +1206,7 @@ def save_pdf_pages_individually(
             )
 
             if not page_info:
-                print(
+                log(
                     f"  Skipping page "
                     f"{index + 1}: element missing"
                 )
@@ -1127,7 +1216,7 @@ def save_pdf_pages_individually(
             height_px = int(page_info["height"])
 
             if width_px <= 0 or height_px <= 0:
-                print(
+                log(
                     f"  Skipping page {index + 1}: "
                     f"invalid geometry "
                     f"{width_px}x{height_px}"
@@ -1137,7 +1226,7 @@ def save_pdf_pages_individually(
             width_inches = width_px / 96.0
             height_inches = height_px / 96.0
 
-            print(
+            log(
                 f"  Page {index + 1}/{page_count} "
                 f"{width_px}x{height_px}px "
                 f"-> "
@@ -1169,10 +1258,8 @@ def save_pdf_pages_individually(
                     "marginLeft": 0,
                     "marginRight": 0,
 
-           
                     "preferCSSPageSize": True,
 
-                
                     "pageRanges": "1",
 
                     "transferMode": "ReturnAsBase64",
@@ -1185,7 +1272,7 @@ def save_pdf_pages_individually(
 
             page_reader = PdfReader(BytesIO(pdf_bytes))
             if len(page_reader.pages) != 1:
-                raise RuntimeError(
+                raise ScribdDownloadError(
                     f"Document page "
                     f"{index + 1} produced "
                     f"{len(page_reader.pages)} "
@@ -1200,12 +1287,12 @@ def save_pdf_pages_individually(
                 page_handle.write(pdf_bytes)
             page_files.append(page_path)
 
-            print(
+            log(
                 f"    OK: exactly 1 PDF sheet"
             )
 
             is_batch_end = (
-                (index + 1) % DEFAULT_EXPORT_BATCH_SIZE == 0
+                (index + 1) % options.export_batch_size == 0
                 or index + 1 == page_count
             )
             if is_batch_end:
@@ -1215,12 +1302,12 @@ def save_pdf_pages_individually(
                 )
 
         if not page_files:
-            raise RuntimeError(
+            raise ScribdDownloadError(
                 "No valid document pages "
                 "were exported."
             )
 
-        print(
+        log(
             f"Merging {len(page_files)} "
             "disk-spooled PDF pages..."
         )
@@ -1238,29 +1325,53 @@ def save_pdf_pages_individually(
 
     return os.path.abspath(filename)
 
-def main():
-    """Run the exporter interactively."""
-    input_url = input("Input link Scribd: ").strip()
 
-    converted_url = convert_scribd_link(input_url)
-    pdf_filename = get_filename_from_url(input_url)
+def download(
+    url,
+    output=None,
+    *,
+    options=None,
+    log=print,
+    **overrides,
+):
+    """
+    Download a Scribd document as a PDF and return the saved path.
 
-    print(f"Link embed: {converted_url}")
-    print(f"Output filename: {pdf_filename}")
+    Args:
+        url: Scribd document URL, e.g.
+            https://www.scribd.com/document/123456789/Document-Title
+            (legacy https://www.scribd.com/doc/... links also work).
+        output: Destination path for the PDF. Defaults to a filename derived
+            from the URL, saved in the current working directory.
+        options: Fully specified :class:`DownloadOptions`. When omitted,
+            options are read from the ``SCRIBD_*`` environment variables.
+        log: Callable receiving progress messages (defaults to ``print``).
+            Pass a logger such as ``logger.info``, or ``None`` for silence.
+        **overrides: Shorthand to override individual :class:`DownloadOptions`
+            fields, e.g. ``headless=False`` or ``export_batch_size=4``.
 
-    if converted_url == "Invalid Scribd URL":
-        print("Error: Please provide a valid Scribd document URL")
-        print(
-            "Example: "
-            "https://www.scribd.com/document/"
-            "123456789/Document-Title"
-        )
-        print(
-            "Example: "
-            "https://www.scribd.com/doc/"
-            "123456789/Document-Title"
-        )
-        raise SystemExit(1)
+    Returns:
+        Path to the saved PDF.
+
+    Raises:
+        InvalidScribdUrlError: If ``url`` is not a valid Scribd document URL.
+        ScribdDownloadError: If the document cannot be loaded or exported.
+    """
+    if options is None:
+        options = DownloadOptions.from_env()
+    if overrides:
+        options = replace(options, **overrides)
+
+    if log is None:
+        log = _noop_log
+
+    embed_url = convert_scribd_link(url)
+    pdf_filename = (
+        str(output) if output is not None else get_filename_from_url(url)
+    )
+
+    log(f"Link embed: {embed_url}")
+    log(f"Output filename: {pdf_filename}")
 
     with tempfile.TemporaryDirectory(
         prefix="scribd-chrome-profile-"
@@ -1268,21 +1379,20 @@ def main():
         driver = None
 
         try:
-            print("\nStarting Chrome browser...")
-
-            options = build_chrome_options(
-                runtime_profile_dir
-            )
+            log("\nStarting Chrome browser...")
 
             driver = webdriver.Chrome(
-                options=options
+                options=build_chrome_options(
+                    runtime_profile_dir,
+                    options,
+                )
             )
 
-            driver.get(converted_url)
+            driver.get(embed_url)
             time.sleep(1)
 
             hide_cookie_dialogs(driver)
-            print("Cookie dialogs hidden.")
+            log("Cookie dialogs hidden.")
 
             total_pages = driver.execute_script(
                 """
@@ -1291,72 +1401,69 @@ def main():
             )
 
             if total_pages == 0:
-                raise RuntimeError(
+                raise ScribdDownloadError(
                     "No printable document pages "
                     "were detected."
                 )
 
-            prepare_document_for_print(driver)
+            prepare_document_for_print(driver, log)
 
-            inject_print_styles(driver)
+            inject_print_styles(driver, log)
 
-            print(
+            log(
                 f"\nSaving PDF as: {pdf_filename}"
             )
 
-            print(
+            log(
                 "  Export mode: "
                 "Individual document pages"
             )
 
-            print("  Margins: None")
+            log("  Margins: None")
 
-            print(
+            log(
                 "  Headers/Footers: Disabled"
             )
 
-            print(
+            log(
                 "  ChromeDriver command timeout: "
-                f"{DEFAULT_CDP_TIMEOUT_SECONDS}s"
+                f"{options.cdp_timeout_seconds}s"
             )
 
             driver.execute_script(
                 "window.scrollTo(0, 0)"
             )
 
-            saved_path = (
-                save_pdf_pages_individually(
-                    driver,
-                    pdf_filename,
-                )
+            saved_path = save_pdf_pages_individually(
+                driver,
+                pdf_filename,
+                options,
+                log,
             )
 
             if not saved_path:
-                raise RuntimeError(
+                raise ScribdDownloadError(
                     "PDF export failed."
                 )
 
-            print(
+            log(
                 "PDF saved successfully to: "
                 f"{saved_path}"
             )
+
+            return Path(saved_path)
 
         except (
             RuntimeError,
             WebDriverException,
         ) as error:
-            print(
+            log(
                 f"Export failed: {error}"
             )
 
-            raise SystemExit(1)
+            raise ScribdDownloadError(str(error)) from error
 
         finally:
             if driver is not None:
                 driver.quit()
-                print("Browser closed.")
-
-
-if __name__ == "__main__":
-    main()
-    
+                log("Browser closed.")
