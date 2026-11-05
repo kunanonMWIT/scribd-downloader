@@ -13,7 +13,7 @@
     <img src="https://img.shields.io/badge/Python-3.10+-blue?style=for-the-badge&logo=python&logoColor=white" alt="Python 3.10+">
   </a>
   <a href="https://pypi.org/project/selenium/">
-    <img src="https://img.shields.io/badge/Selenium-4.0+-green?style=for-the-badge&logo=selenium&logoColor=white" alt="Selenium 4.0+">
+    <img src="https://img.shields.io/badge/Selenium-4.32+-green?style=for-the-badge&logo=selenium&logoColor=white" alt="Selenium 4.32+">
   </a>
   <a href="LICENSE">
     <img src="https://img.shields.io/badge/License-MIT-orange?style=for-the-badge" alt="MIT License">
@@ -21,14 +21,8 @@
 </p>
 
 <p align="center">
-  <a href="https://buymeacoffee.com/mrsami">
-    <img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-ffdd00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black" alt="Buy Me A Coffee">
-  </a>
-  <a href="https://github.com/sponsors/fullstackusama">
-    <img src="https://img.shields.io/badge/Sponsor-ea4aaa?style=for-the-badge&logo=github-sponsors&logoColor=white" alt="GitHub Sponsors">
-  </a>
-  <a href="https://github.com/fullstackusama/scribd-downloader/stargazers">
-    <img src="https://img.shields.io/github/stars/fullstackusama/scribd-downloader?style=for-the-badge&logo=github" alt="GitHub Stars">
+  <a href="https://github.com/kunanonMWIT/scribd-downloader/stargazers">
+    <img src="https://img.shields.io/github/stars/kunanonMWIT/scribd-downloader?style=for-the-badge&logo=github" alt="GitHub Stars">
   </a>
 </p>
 
@@ -272,13 +266,9 @@ Contributions are welcome! Feel free to:
 
 ## Support the Project
 
-If you find this tool useful, consider supporting its development:
+If you want to support this project, it is better to support the original creator's Buy Me A Coffee in the original repository.
 
-<p align="center">
-  <a href="https://buymeacoffee.com/mrsami">
-    <img src="assets/buymeacoffee.svg" alt="Buy Me A Coffee" width="40" height="40">
-  </a>
-</p>
+A star is appreciated.
 
 ---
 
@@ -293,10 +283,6 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 This tool is for educational purposes only. Please respect copyright laws and Scribd's Terms of Service. Only download documents you have the right to access.
 
 ---
-
-<p align="center">
-  Made with ❤️ by <a href="https://github.com/fullstackusama">Usama Nazir</a>
-</p>
 
 <p align="center">
   If you find this useful, please consider giving it a ⭐
