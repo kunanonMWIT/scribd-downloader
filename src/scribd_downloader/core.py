@@ -19,12 +19,13 @@ Key behaviors:
 3. Loads document pages in bounded batches (with a scrolling fallback).
 4. Removes UI overlays without stripping layout classes needed for rendering.
 5. Waits for fonts, images, and page geometry to settle.
-6. Saves the PDF through Chrome DevTools Protocol with a larger timeout and
-   stream-based PDF transfer for large documents.
+6. Saves the PDF through Chrome DevTools Protocol with a larger timeout.
 
 The ``SCRIBD_*`` environment variables keep their original meaning and are
 honored by ``DownloadOptions.from_env()``, which ``download()`` uses whenever
-it is called without explicit options.
+it is called without explicit options. ``parallel_shards`` (default 1, also
+via the ``SCRIBD_PARALLEL_SHARDS`` environment variable) splits the page
+export across several concurrent Chrome instances and merges the results.
 """
 
 from __future__ import annotations
@@ -33,7 +34,9 @@ import base64
 import os
 import re
 import tempfile
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from io import BytesIO
 from pathlib import Path
@@ -85,7 +88,7 @@ class DownloadOptions:
     page_load_concurrency: int = 8
     page_load_timeout_seconds: int = 120
     export_batch_size: int = 8
-    pdf_stream_chunk_size: int = 1024 * 1024
+    parallel_shards: int = 1
 
     @classmethod
     def from_env(cls) -> "DownloadOptions":
@@ -112,8 +115,9 @@ class DownloadOptions:
                 1,
                 int(os.getenv("SCRIBD_EXPORT_BATCH_SIZE", "8")),
             ),
-            pdf_stream_chunk_size=int(
-                os.getenv("SCRIBD_PDF_STREAM_CHUNK_SIZE", str(1024 * 1024))
+            parallel_shards=max(
+                1,
+                min(64, int(os.getenv("SCRIBD_PARALLEL_SHARDS", "1"))),
             ),
         )
 
@@ -798,34 +802,6 @@ def detect_document_paper_size(driver):
     }
 
 
-def read_pdf_stream_to_file(driver, stream_handle, filename, chunk_size=1024 * 1024):
-    """Read a streamed CDP PDF result and write it to disk in chunks."""
-    try:
-        with open(filename, "wb") as file_handle:
-            while True:
-                chunk = driver.execute_cdp_cmd(
-                    "IO.read",
-                    {
-                        "handle": stream_handle,
-                        "size": chunk_size,
-                    },
-                )
-
-                data = chunk.get("data", "")
-                if not data and chunk.get("eof"):
-                    break
-
-                if chunk.get("base64Encoded"):
-                    file_handle.write(base64.b64decode(data))
-                else:
-                    file_handle.write(data.encode("utf-8"))
-
-                if chunk.get("eof"):
-                    break
-    finally:
-        driver.execute_cdp_cmd("IO.close", {"handle": stream_handle})
-
-
 def load_page_batch(driver, page_numbers, options):
     """Load one bounded batch of page DOM and image assets."""
     configure_command_timeout(
@@ -990,66 +966,31 @@ def release_page_batch(driver, page_numbers):
         pass
 
 
-def save_pdf_pages_individually(
-    driver,
-    filename,
-    options,
-    log=_noop_log,
-):
-    """Export each document page as one PDF sheet and merge them with pypdf."""
-    from pypdf import PdfReader, PdfWriter
+def wait_for_document_ready(driver, timeout_seconds, log=_noop_log):
+    """
+    Wait until the Scribd embed exposes its page manager.
 
-    configure_command_timeout(
-        driver,
-        options.cdp_timeout_seconds,
-    )
+    Replaces the fixed post-navigation sleep with a condition-based wait that
+    returns as soon as the document pages are addressable.
+    """
+    deadline = time.monotonic() + timeout_seconds
 
-    page_count = driver.execute_script(
-        """
-        return document.querySelectorAll(
-            '.outer_page'
-        ).length;
-        """
-    )
-
-    if page_count <= 0:
-        raise ScribdDownloadError(
-            "No .outer_page elements found."
+    while time.monotonic() < deadline:
+        ready = driver.execute_script(
+            "return !!(window.docManager && window.docManager.pages && "
+            "Object.keys(window.docManager.pages).length > 0);"
         )
 
-    log(
-        f"Exporting {page_count} "
-        "document pages in bounded batches "
-        f"of {options.export_batch_size}..."
-    )
+        if ready:
+            return True
 
-    spool = tempfile.TemporaryDirectory(
-        prefix="scribd-pdf-pages-"
-    )
-    page_files = []
+        time.sleep(0.1)
 
-    try:
-        for index in range(page_count):
-            if index % options.export_batch_size == 0:
-                batch_end = min(
-                    page_count,
-                    index + options.export_batch_size,
-                )
-                batch_page_numbers = list(
-                    range(index + 1, batch_end + 1)
-                )
-                log(
-                    f"  Loading page batch "
-                    f"{index + 1}-{batch_end}/{page_count}..."
-                )
-                load_page_batch(
-                    driver,
-                    batch_page_numbers,
-                    options,
-                )
+    log("Document readiness wait timed out; continuing.")
+    return False
 
-            page_info = driver.execute_script(
-                """
+
+_ISOLATED_PAGE_SCRIPT = """
                 const targetIndex = arguments[0];
 
                 const pages = Array.from(
@@ -1201,105 +1142,217 @@ def save_pdf_pages_individually(
                     width,
                     height
                 };
-                """,
-                index,
+"""
+
+
+_PAGE_COUNT_SCRIPT = """
+return document.querySelectorAll(
+    '.outer_page'
+).length;
+"""
+
+
+def export_pages(
+    driver,
+    spool_dir,
+    options,
+    log,
+    start_index,
+    end_index,
+    page_count,
+):
+    """Export pages [start_index, end_index) as one PDF sheet each.
+
+    Returns the list of spooled one-page PDF file paths, in page order.
+    """
+    from pypdf import PdfReader
+
+    configure_command_timeout(
+        driver,
+        options.cdp_timeout_seconds,
+    )
+
+    page_files = []
+
+    for index in range(start_index, end_index):
+        if (index - start_index) % options.export_batch_size == 0:
+            batch_end = min(
+                end_index,
+                index + options.export_batch_size,
             )
-
-            if not page_info:
-                log(
-                    f"  Skipping page "
-                    f"{index + 1}: element missing"
-                )
-                continue
-
-            width_px = int(page_info["width"])
-            height_px = int(page_info["height"])
-
-            if width_px <= 0 or height_px <= 0:
-                log(
-                    f"  Skipping page {index + 1}: "
-                    f"invalid geometry "
-                    f"{width_px}x{height_px}"
-                )
-                continue
-
-            width_inches = width_px / 96.0
-            height_inches = height_px / 96.0
-
+            batch_page_numbers = list(
+                range(index + 1, batch_end + 1)
+            )
             log(
-                f"  Page {index + 1}/{page_count} "
-                f"{width_px}x{height_px}px "
-                f"-> "
-                f'{width_inches:.3f}"'
-                f'x{height_inches:.3f}"'
+                f"  Loading page batch "
+                f"{index + 1}-{batch_end}/{page_count}..."
+            )
+            load_page_batch(
+                driver,
+                batch_page_numbers,
+                options,
             )
 
-            driver.execute_cdp_cmd(
-                "Emulation.setEmulatedMedia",
-                {
-                    "media": "print",
-                },
-            )
+        page_info = driver.execute_script(
+            _ISOLATED_PAGE_SCRIPT,
+            index,
+        )
 
-            result = driver.execute_cdp_cmd(
-                "Page.printToPDF",
-                {
-                    "landscape": False,
-                    "displayHeaderFooter": False,
-                    "printBackground": True,
-
-                    "scale": 1,
-
-                    "paperWidth": width_inches,
-                    "paperHeight": height_inches,
-
-                    "marginTop": 0,
-                    "marginBottom": 0,
-                    "marginLeft": 0,
-                    "marginRight": 0,
-
-                    "preferCSSPageSize": True,
-
-                    "pageRanges": "1",
-
-                    "transferMode": "ReturnAsBase64",
-                },
-            )
-
-            pdf_bytes = base64.b64decode(
-                result["data"]
-            )
-
-            page_reader = PdfReader(BytesIO(pdf_bytes))
-            if len(page_reader.pages) != 1:
-                raise ScribdDownloadError(
-                    f"Document page "
-                    f"{index + 1} produced "
-                    f"{len(page_reader.pages)} "
-                    "PDF sheets; expected exactly 1."
-                )
-
-            page_path = os.path.join(
-                spool.name,
-                f"page-{index + 1:08d}.pdf",
-            )
-            with open(page_path, "wb") as page_handle:
-                page_handle.write(pdf_bytes)
-            page_files.append(page_path)
-
+        if not page_info:
             log(
-                f"    OK: exactly 1 PDF sheet"
+                f"  Skipping page "
+                f"{index + 1}: element missing"
+            )
+            continue
+
+        width_px = int(page_info["width"])
+        height_px = int(page_info["height"])
+
+        if width_px <= 0 or height_px <= 0:
+            log(
+                f"  Skipping page {index + 1}: "
+                f"invalid geometry "
+                f"{width_px}x{height_px}"
+            )
+            continue
+
+        width_inches = width_px / 96.0
+        height_inches = height_px / 96.0
+
+        log(
+            f"  Page {index + 1}/{page_count} "
+            f"{width_px}x{height_px}px "
+            f"-> "
+            f'{width_inches:.3f}"'
+            f'x{height_inches:.3f}"'
+        )
+
+        driver.execute_cdp_cmd(
+            "Emulation.setEmulatedMedia",
+            {
+                "media": "print",
+            },
+        )
+
+        print_params = {
+            "landscape": False,
+            "displayHeaderFooter": False,
+            "printBackground": True,
+
+            "scale": 1,
+
+            "paperWidth": width_inches,
+            "paperHeight": height_inches,
+
+            "marginTop": 0,
+            "marginBottom": 0,
+            "marginLeft": 0,
+            "marginRight": 0,
+
+            "preferCSSPageSize": True,
+
+            "pageRanges": "1",
+        }
+
+        page_path = os.path.join(
+            spool_dir,
+            f"page-{index + 1:08d}.pdf",
+        )
+
+        print_params["transferMode"] = "ReturnAsBase64"
+        result = driver.execute_cdp_cmd(
+            "Page.printToPDF",
+            print_params,
+        )
+
+        pdf_bytes = base64.b64decode(
+            result["data"]
+        )
+
+        page_reader = PdfReader(BytesIO(pdf_bytes))
+
+        with open(page_path, "wb") as page_handle:
+            page_handle.write(pdf_bytes)
+
+        if len(page_reader.pages) != 1:
+            raise ScribdDownloadError(
+                f"Document page "
+                f"{index + 1} produced "
+                f"{len(page_reader.pages)} "
+                "PDF sheets; expected exactly 1."
             )
 
-            is_batch_end = (
-                (index + 1) % options.export_batch_size == 0
-                or index + 1 == page_count
+        page_files.append(page_path)
+
+        log(
+            f"    OK: exactly 1 PDF sheet"
+        )
+
+        is_batch_end = (
+            (index + 1 - start_index) % options.export_batch_size == 0
+            or index + 1 == end_index
+        )
+        if is_batch_end:
+            release_page_batch(
+                driver,
+                batch_page_numbers,
             )
-            if is_batch_end:
-                release_page_batch(
-                    driver,
-                    batch_page_numbers,
-                )
+
+    return page_files
+
+
+def _merge_page_pdfs(page_files, filename, log=_noop_log):
+    """Combine spooled one-page PDFs into the final document."""
+    from pypdf import PdfWriter
+
+    log(
+        f"Merging {len(page_files)} "
+        "disk-spooled PDF pages..."
+    )
+    writer = PdfWriter()
+    try:
+        for page_path in page_files:
+            writer.append(page_path)
+        with open(filename, "wb") as output_handle:
+            writer.write(output_handle)
+    finally:
+        writer.close()
+
+
+def save_pdf_pages_individually(
+    driver,
+    filename,
+    options,
+    log=_noop_log,
+):
+    """Export each document page as one PDF sheet and merge them with pypdf."""
+    page_count = driver.execute_script(_PAGE_COUNT_SCRIPT)
+
+    if page_count <= 0:
+        raise ScribdDownloadError(
+            "No .outer_page elements found."
+        )
+
+    log(
+        f"Exporting {page_count} "
+        "document pages in bounded batches "
+        f"of {options.export_batch_size}..."
+    )
+
+    spool = tempfile.TemporaryDirectory(
+        prefix="scribd-pdf-pages-"
+    )
+
+    try:
+        page_files = export_pages(
+            driver,
+            spool.name,
+            options,
+            log,
+            0,
+            page_count,
+            page_count,
+        )
 
         if not page_files:
             raise ScribdDownloadError(
@@ -1307,19 +1360,175 @@ def save_pdf_pages_individually(
                 "were exported."
             )
 
-        log(
-            f"Merging {len(page_files)} "
-            "disk-spooled PDF pages..."
-        )
-        writer = PdfWriter()
-        try:
-            for page_path in page_files:
-                writer.append(page_path)
-            with open(filename, "wb") as output_handle:
-                writer.write(output_handle)
-        finally:
-            writer.close()
+        _merge_page_pdfs(page_files, filename, log)
+    finally:
+        spool.cleanup()
 
+    return os.path.abspath(filename)
+
+
+def _make_shard_log(shard_number, shard_count, base_log, lock):
+    """Wrap a log callable so shard output is prefixed and line-atomic."""
+    prefix = f"[shard {shard_number}/{shard_count}] "
+
+    def shard_log(message):
+        with lock:
+            base_log(prefix + str(message))
+
+    return shard_log
+
+
+def _split_page_ranges(page_count, shard_count):
+    """Split [0, page_count) into shard_count contiguous half-open ranges."""
+    base, remainder = divmod(page_count, shard_count)
+    ranges = []
+    start = 0
+
+    for shard_index in range(shard_count):
+        size = base + (1 if shard_index < remainder else 0)
+        ranges.append((start, start + size))
+        start += size
+
+    return ranges
+
+
+def _run_export_shard(
+    shard_index,
+    page_range,
+    shard_count,
+    embed_url,
+    page_count,
+    main_driver,
+    spool_dir,
+    options,
+    base_log,
+    log_lock,
+):
+    """Export one shard's pages with its own Chrome (shard 0 reuses the main one)."""
+    start_index, end_index = page_range
+    shard_log = _make_shard_log(
+        shard_index + 1,
+        shard_count,
+        base_log,
+        log_lock,
+    )
+
+    own_driver = shard_index != 0
+    profile_tempdir = None
+    driver = main_driver
+
+    try:
+        if own_driver:
+            profile_tempdir = tempfile.TemporaryDirectory(
+                prefix=f"scribd-chrome-profile-shard{shard_index + 1}-"
+            )
+
+            shard_log("Starting Chrome browser...")
+            driver = webdriver.Chrome(
+                options=build_chrome_options(profile_tempdir.name, options)
+            )
+
+            driver.get(embed_url)
+
+            wait_for_document_ready(driver, 15, shard_log)
+
+            hide_cookie_dialogs(driver)
+            shard_log("Cookie dialogs hidden.")
+
+        observed_page_count = driver.execute_script(_PAGE_COUNT_SCRIPT)
+
+        if observed_page_count != page_count:
+            raise ScribdDownloadError(
+                f"Shard {shard_index + 1} detected "
+                f"{observed_page_count} pages; "
+                f"expected {page_count}."
+            )
+
+        prepare_document_for_print(driver, shard_log)
+        inject_print_styles(driver, shard_log)
+        driver.execute_script("window.scrollTo(0, 0)")
+        shard_log(
+            f"Exporting pages {start_index + 1}-{end_index}..."
+        )
+
+        return export_pages(
+            driver,
+            spool_dir,
+            options,
+            shard_log,
+            start_index,
+            end_index,
+            page_count,
+        )
+    finally:
+        if own_driver and driver is not None:
+            driver.quit()
+            shard_log("Browser closed.")
+
+        if profile_tempdir is not None:
+            profile_tempdir.cleanup()
+
+
+def save_pdf_pages_sharded(
+    driver,
+    filename,
+    options,
+    log=_noop_log,
+):
+    """Export pages across several parallel Chrome instances, then merge them."""
+    page_count = driver.execute_script(_PAGE_COUNT_SCRIPT)
+
+    if page_count <= 0:
+        raise ScribdDownloadError(
+            "No .outer_page elements found."
+        )
+
+    shard_count = max(1, min(options.parallel_shards, page_count))
+    shard_ranges = _split_page_ranges(page_count, shard_count)
+
+    log(
+        f"Exporting {page_count} "
+        "document pages across "
+        f"{shard_count} parallel browser shards..."
+    )
+
+    spool = tempfile.TemporaryDirectory(
+        prefix="scribd-pdf-pages-shared-"
+    )
+    log_lock = threading.Lock()
+
+    try:
+        with ThreadPoolExecutor(max_workers=shard_count) as pool:
+            futures = [
+                pool.submit(
+                    _run_export_shard,
+                    shard_index,
+                    shard_ranges[shard_index],
+                    shard_count,
+                    driver.current_url,
+                    page_count,
+                    driver,
+                    spool.name,
+                    options,
+                    log,
+                    log_lock,
+                )
+                for shard_index in range(shard_count)
+            ]
+
+            page_files = []
+            for future in futures:
+                page_files.extend(future.result())
+
+        page_files.sort()
+
+        if not page_files:
+            raise ScribdDownloadError(
+                "No valid document pages "
+                "were exported."
+            )
+
+        _merge_page_pdfs(page_files, filename, log)
     finally:
         spool.cleanup()
 
@@ -1389,7 +1598,8 @@ def download(
             )
 
             driver.get(embed_url)
-            time.sleep(1)
+
+            wait_for_document_ready(driver, 15, log)
 
             hide_cookie_dialogs(driver)
             log("Cookie dialogs hidden.")
@@ -1434,12 +1644,20 @@ def download(
                 "window.scrollTo(0, 0)"
             )
 
-            saved_path = save_pdf_pages_individually(
-                driver,
-                pdf_filename,
-                options,
-                log,
-            )
+            if options.parallel_shards > 1:
+                saved_path = save_pdf_pages_sharded(
+                    driver,
+                    pdf_filename,
+                    options,
+                    log,
+                )
+            else:
+                saved_path = save_pdf_pages_individually(
+                    driver,
+                    pdf_filename,
+                    options,
+                    log,
+                )
 
             if not saved_path:
                 raise ScribdDownloadError(

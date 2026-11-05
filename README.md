@@ -106,7 +106,9 @@ uv run scribd-downloader <url> --batch-size 4 --cdp-timeout 900
 uv run python -m scribd_downloader
 ```
 
-Useful CLI flags: `-o/--output` (PDF path), `--visible`, `--batch-size`, `--cdp-timeout`, `--page-load-timeout`, `--concurrency`, `-q/--quiet`, `--version`.
+Useful CLI flags: `-o/--output` (PDF path), `--visible`, `--batch-size`, `--cdp-timeout`, `--page-load-timeout`, `--concurrency`, `--shards N` (parallel Chrome instances, 1-64, off by default), `-q/--quiet`, `--version`.
+
+Note: sharding only gives benefits when the request is large. Above 8 shards the memory usages are tremendous for most use cases.
 
 Both Scribd URL styles work: `/document/...` and legacy `/doc/...`.
 
@@ -132,6 +134,7 @@ pdf_path = download(
     headless=False,           # watch Chrome work
     export_batch_size=4,      # fewer pages in memory at once
     cdp_timeout_seconds=900,  # more patient PDF printing
+    parallel_shards=4,        # split export across 4 Chrome instances (default: 1)
     log=None,                 # silence progress messages
 )
 ```
@@ -210,19 +213,6 @@ Browser closed.
 
 ---
 
-## Benchmarks
-
-Reference results from one Windows machine are shown below. Performance varies with network speed, document complexity, CPU, RAM, Chrome version, and storage speed.
-
-| Document | Pages | Total Time | Output Size | Blank Pages | Peak Combined RAM |
-|----------|------:|-----------:|------------:|------------:|------------------:|
-| CSS Solved Past Papers | 359 | 58.36 seconds | 228.49 MB | 0 | 1.47 GB |
-| Manual de Servicio MX-305 | 2,552 | 14 minutes 12 seconds | 237.28 MB | 0 | 2.46 GB |
-
-The batch size was `8` in both tests. Long documents still take time because Chrome must print every page individually, but fully loaded browser content is kept to one batch at a time.
-
----
-
 ## Troubleshooting
 
 ### "ChromeDriver not found" error
@@ -264,6 +254,7 @@ Useful variables:
 - `SCRIBD_PAGE_LOAD_TIMEOUT` - Maximum direct page-loading time in seconds (default: `120`)
 - `SCRIBD_EXPORT_BATCH_SIZE` - Maximum fully loaded pages kept in Chrome at once (default: `8`)
 - `SCRIBD_HEADLESS=0` - Run with a visible browser when debugging rendering issues locally
+- `SCRIBD_PARALLEL_SHARDS=N` - Split the export across N parallel Chrome instances from 1 to 64. Memory usage scales with the number of instances.
 
 ---
 

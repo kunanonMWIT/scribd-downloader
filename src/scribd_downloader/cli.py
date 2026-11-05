@@ -54,6 +54,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Parallel page loads when prefetching the document (default: 8).",
     )
     parser.add_argument(
+        "--shards",
+        type=int,
+        help=(
+            "Split the export across N parallel Chrome instances, where each instance is a shard. The default amount is 1, while the maximum amount of shardsi is 64 (Although this isn't recommended due to memory usages). (experimental)"
+        ),
+    )
+    parser.add_argument(
         "-q",
         "--quiet",
         action="store_true",
@@ -90,6 +97,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         overrides["export_batch_size"] = args.batch_size
     if args.concurrency is not None:
         overrides["page_load_concurrency"] = args.concurrency
+    if args.shards is not None:
+        overrides["parallel_shards"] = args.shards
 
     try:
         download(
